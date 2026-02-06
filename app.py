@@ -5,6 +5,11 @@ import asyncio
 app = FastAPI(title="Vidssave Session Generator API (GET)")
 
 
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+
 def cookies_to_netscape(cookies):
     lines = ["# Netscape HTTP Cookie File"]
     for c in cookies:
@@ -24,8 +29,8 @@ def cookies_to_netscape(cookies):
 
 @app.get("/vidssave")
 async def generate_session(
-    youtube_url: str = Query(...),
-    quality: str = Query("360P"),
+    youtube_url: str = Query(..., description="YouTube video URL"),
+    quality: str = Query("360P", description="360P / 720P"),
 ):
     parse_payload = None
     download_url = None
@@ -40,7 +45,15 @@ async def generate_session(
             ],
         )
 
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 720},
+        )
+
         page = await context.new_page()
 
         def capture_request(req):
@@ -52,21 +65,36 @@ async def generate_session(
 
         page.on("request", capture_request)
 
-        await page.goto("https://vidssave.com/", timeout=60000)
-        await page.wait_for_selector("input", timeout=20000)
-        await page.fill("input", youtube_url)
+        # Open site
+        await page.goto(
+            "https://vidssave.com/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
 
-        for btn in await page.locator("button").all():
-            if await btn.is_visible():
-                await btn.click()
-                break
+        # Cloudflare / slow dyno safety
+        await page.wait_for_timeout(5000)
 
-        await asyncio.sleep(6)
+        try:
+            await page.wait_for_selector(
+                "input[type='text']",
+                timeout=60000,
+            )
+        except:
+            await browser.close()
+            raise HTTPException(500, "Vidssave input not loaded (blocked or slow)")
+
+        # Submit URL
+        await page.fill("input[type='text']", youtube_url)
+        await page.keyboard.press("Enter")
+
+        await asyncio.sleep(8)
 
         if not parse_payload:
             await browser.close()
-            raise HTTPException(500, "Parse payload not captured")
+            raise HTTPException(500, "Failed to capture parse payload")
 
+        # Parse API (same browser session)
         response = await page.evaluate(
             """
             async (payload) => {
@@ -100,7 +128,7 @@ async def generate_session(
 
         if not download_url:
             await browser.close()
-            raise HTTPException(404, "Download URL not found")
+            raise HTTPException(404, "Direct download URL not found")
 
         cookies_json = await context.cookies()
         cookies_netscape = cookies_to_netscape(cookies_json)
