@@ -1,22 +1,16 @@
-import logging
-import asyncio
 from fastapi import FastAPI, HTTPException, Query
 from playwright.async_api import async_playwright
+import asyncio
+import logging
 
-# ---------------- LOGGING SETUP ----------------
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("vidssave")
+logger = logging.getLogger(__name__)
 
-# ---------------- APP ----------------
 app = FastAPI(title="Vidssave Session Generator API (GET)")
-
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
 
 
 def cookies_to_netscape(cookies):
@@ -39,133 +33,131 @@ def cookies_to_netscape(cookies):
 @app.get("/vidssave")
 async def generate_session(
     youtube_url: str = Query(..., description="YouTube video URL"),
-    quality: str = Query("360P", description="360P / 720P"),
+    quality: str = Query("360P", description="Video quality e.g. 360P, 720P"),
 ):
-    logger.info("Incoming request | url=%s | quality=%s", youtube_url, quality)
-
+    logger.info(f"Starting session generation for URL: {youtube_url}, Quality: {quality}")
     parse_payload = None
     download_url = None
 
-    try:
-        async with async_playwright() as p:
-            logger.info("Launching Chromium browser")
+    async with async_playwright() as p:
+        logger.info("Launching Chromium browser in headless mode")
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        logger.info("Browser launched successfully")
 
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
+        logger.info("Creating new browser context and page")
+        context = await browser.new_context()
+        page = await context.new_page()
+        logger.info("Browser context and page created")
 
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 720},
-            )
+        # Capture origin=cache parse request
+        def capture_request(req):
+            nonlocal parse_payload
+            if "/media/parse" in req.url and req.method == "POST":
+                body = req.post_data or ""
+                if "origin=cache" in body:
+                    logger.info("Captured parse payload from request")
+                    parse_payload = req.post_data
 
-            page = await context.new_page()
+        logger.info("Setting up request interceptor")
+        page.on("request", capture_request)
 
-            def capture_request(req):
-                nonlocal parse_payload
-                if "/media/parse" in req.url and req.method == "POST":
-                    body = req.post_data or ""
-                    if "origin=cache" in body:
-                        parse_payload = body
-                        logger.info("Parse payload captured")
+        # Open site and submit URL
+        logger.info("Navigating to vidssave.com")
+        await page.goto("https://vidssave.com/", timeout=60000)
+        logger.info("Page loaded successfully")
+        
+        logger.info("Waiting for input field")
+        await page.wait_for_selector("input", timeout=20000)
+        logger.info(f"Filling input field with URL: {youtube_url}")
+        await page.fill("input", youtube_url)
 
-            page.on("request", capture_request)
+        logger.info("Looking for submit button")
+        for btn in await page.locator("button").all():
+            if await btn.is_visible():
+                logger.info("Clicking submit button")
+                await btn.click()
+                break
 
-            logger.info("Opening vidssave.com")
-            await page.goto(
-                "https://vidssave.com/",
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
+        logger.info("Waiting 6 seconds for response")
+        await asyncio.sleep(6)
 
-            await page.wait_for_timeout(5000)
-
-            try:
-                logger.info("Waiting for input field")
-                await page.wait_for_selector("input[type='text']", timeout=60000)
-            except Exception:
-                logger.error("Input field not found (Cloudflare or block)")
-                await browser.close()
-                raise HTTPException(
-                    500, "Vidssave page blocked or input not loaded"
-                )
-
-            logger.info("Submitting YouTube URL")
-            await page.fill("input[type='text']", youtube_url)
-            await page.keyboard.press("Enter")
-
-            logger.info("Waiting for parse request")
-            await asyncio.sleep(8)
-
-            if not parse_payload:
-                logger.error("Parse payload not captured")
-                await browser.close()
-                raise HTTPException(500, "Failed to capture parse payload")
-
-            logger.info("Calling Vidssave parse API")
-
-            response = await page.evaluate(
-                """
-                async (payload) => {
-                    const r = await fetch(
-                        "https://api.vidssave.com/api/contentsite_api/media/parse",
-                        {
-                            method: "POST",
-                            headers: {
-                                "content-type": "application/x-www-form-urlencoded"
-                            },
-                            body: payload
-                        }
-                    );
-                    return await r.json();
-                }
-                """,
-                parse_payload,
-            )
-
-            resources = response.get("data", {}).get("resources", [])
-            logger.info("Resources found: %d", len(resources))
-
-            for r in resources:
-                if (
-                    r.get("type") == "video"
-                    and r.get("format") == "MP4"
-                    and r.get("quality") == quality
-                    and r.get("download_mode") == "direct"
-                ):
-                    download_url = r["download_url"]
-                    break
-
-            if not download_url:
-                logger.warning("Direct MP4 not found for quality=%s", quality)
-                await browser.close()
-                raise HTTPException(404, "Direct download URL not found")
-
-            cookies_json = await context.cookies()
-            cookies_netscape = cookies_to_netscape(cookies_json)
-
-            logger.info("Success | download URL generated")
-
+        if not parse_payload:
+            logger.error("Failed to capture parse payload")
             await browser.close()
+            raise HTTPException(500, "Failed to capture parse payload")
+        
+        logger.info("Parse payload captured successfully")
 
-            return {
-                "download_url": download_url,
-                "cookies": cookies_json,
-                "cookies_netscape": cookies_netscape,
+        # Call parse API inside SAME browser session
+        logger.info("Calling parse API with captured payload")
+        response = await page.evaluate(
+            """
+            async (payload) => {
+                const r = await fetch(
+                    "https://api.vidssave.com/api/contentsite_api/media/parse",
+                    {
+                        method: "POST",
+                        headers: {
+                            "content-type": "application/x-www-form-urlencoded"
+                        },
+                        body: payload
+                    }
+                );
+                return await r.json();
             }
+            """,
+            parse_payload,
+        )
+        logger.info("Parse API response received")
 
-    except HTTPException:
-        raise
+        resources = response.get("data", {}).get("resources", [])
+        logger.info(f"Found {len(resources)} resources in response")
 
-    except Exception as e:
-        logger.exception("Unhandled error")
-        raise HTTPException(500, f"Internal error: {str(e)}")
+        logger.info(f"Searching for video with quality: {quality}")
+        for r in resources:
+            if (
+                r.get("type") == "video"
+                and r.get("format") == "MP4"
+                and r.get("quality") == quality
+                and r.get("download_mode") == "direct"
+            ):
+                download_url = r["download_url"]
+                logger.info(f"Found matching download URL for quality {quality}")
+                break
+
+        if not download_url:
+            logger.error(f"Direct download URL not found for quality {quality}")
+            await browser.close()
+            raise HTTPException(404, "Direct download URL not found")
+        
+        logger.info("Download URL found successfully")
+
+        logger.info("Extracting cookies from browser context")
+        cookies_json = await context.cookies()
+        logger.info(f"Extracted {len(cookies_json)} cookies")
+        
+        logger.info("Converting cookies to Netscape format")
+        cookies_netscape = cookies_to_netscape(cookies_json)
+
+        logger.info("Closing browser")
+        await browser.close()
+        logger.info("Browser closed successfully")
+
+    logger.info("Session generation completed successfully")
+    return {
+        "download_url": download_url,
+        "cookies": cookies_json,
+        "cookies_netscape": cookies_netscape
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app)
